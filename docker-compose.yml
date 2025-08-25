@@ -1,14 +1,14 @@
 version: '3.8'
 
 # Moby SwagStore - Secure MCP-Enabled E-commerce Platform
-# Based on pen-shop-demo architecture with enhanced security
+# Based on pen-shop-demo architecture with proper MCP Gateway and host-based Qwen model
 
 x-common-variables: &common-variables
   POSTGRES_DB: swagstore
   POSTGRES_USER: swagstore_user
   REDIS_URL: redis://redis:6379
-  MCP_GATEWAY_URL: http://mcp-gateway:8080
-  QWEN_MODEL_URL: http://qwen-model:8000
+  MCP_GATEWAY_URL: http://mcp-gateway:8081
+  QWEN_MODEL_URL: http://host.docker.internal:11434  # Qwen running on host via Model Runner
   WAZUH_MANAGER: wazuh-manager:1514
 
 x-security-labels: &security-labels
@@ -119,9 +119,9 @@ services:
       - redis
       - mcp-gateway
 
-  # MCP Gateway - Containerized Security Layer
+  # MCP Gateway - Docker's Official MCP Gateway (Corrected Port)
   mcp-gateway:
-    image: registry.hub.docker.com/ajeetraina/mcp-gateway-hardened:latest
+    image: docker/mcp-gateway:latest
     container_name: swagstore-mcp-gateway
     user: "1000:1000"  # rootless
     restart: unless-stopped
@@ -131,12 +131,14 @@ services:
       OUTPUT_FILTERING: "enabled"
       RATE_LIMITING: "true"
       AUDIT_LOGGING: "verbose"
+      TRANSPORT: "streaming"
     ports:
-      - "8080:8080"
+      - "8081:8081"  # Corrected port as per pen-shop-demo
     volumes:
       - ./config/mcp-gateway:/etc/mcp-gateway:ro
       - ./security/policies:/etc/security:ro
       - ./data/logs:/var/log/mcp:rw
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # For managing MCP servers
     networks:
       - backend
       - monitoring
@@ -147,47 +149,14 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    cap_add:
+      - DAC_OVERRIDE  # To access docker socket
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-
-  # Qwen Model Server - Hardened AI Model
-  qwen-model:
-    image: registry.hub.docker.com/ajeetraina/qwen-hardened:latest
-    container_name: swagstore-qwen
-    user: "1000:1000"  # rootless
-    restart: unless-stopped
-    environment:
-      MODEL_NAME: "Qwen2.5-7B-Instruct"
-      MAX_TOKENS: 4096
-      TEMPERATURE: 0.7
-      SECURITY_MODE: "strict"
-    volumes:
-      - ./data/models:/models:ro
-      - ./security/policies/ai-safety.json:/etc/ai-safety.json:ro
-    networks:
-      - backend
-    labels: *security-labels
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    read_only: true
-    tmpfs:
-      - /tmp
-    deploy:
-      resources:
-        limits:
-          memory: 8G
-        reservations:
-          memory: 4G
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 60s
-      timeout: 30s
-      retries: 3
+    command: ["gateway", "run", "--port", "8081", "--transport", "streaming"]
 
   # Database - Hardened PostgreSQL
   postgres:
@@ -200,7 +169,7 @@ services:
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       POSTGRES_INITDB_ARGS: "--auth-local=peer --auth-host=md5"
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql/data
       - ./database/init:/docker-entrypoint-initdb.d:ro
       - ./security/certificates/ca.crt:/var/lib/postgresql/ca.crt:ro
     networks:
@@ -233,8 +202,8 @@ services:
     restart: unless-stopped
     command: ["redis-server", "/etc/redis/redis.conf"]
     volumes:
+      - redis-data:/data
       - ./config/redis/redis.conf:/etc/redis/redis.conf:ro
-      - ./data/redis:/data
     networks:
       - backend
       - monitoring
@@ -264,6 +233,7 @@ services:
       INDEXER_PASSWORD: "SecretPassword"
       FILEBEAT_SSL_VERIFICATION_MODE: "certificate"
     volumes:
+      - wazuh-data:/var/ossec/data
       - ./config/wazuh/wazuh.conf:/var/ossec/etc/ossec.conf:ro
       - ./data/logs:/var/log/host-logs:ro
       - ./security/certificates:/etc/ssl/certs:ro
@@ -315,7 +285,7 @@ services:
       timeout: 30s
       retries: 3
 
-  # MCP Defender - Input Sanitization
+  # MCP Defender - Input Sanitization (Containerized MCP Server)
   mcp-defender:
     image: registry.hub.docker.com/ajeetraina/mcp-defender-hardened:latest
     container_name: swagstore-mcp-defender
@@ -340,7 +310,7 @@ services:
     tmpfs:
       - /tmp
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -371,7 +341,7 @@ services:
     depends_on:
       - wazuh-manager
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8083/health"]
       interval: 60s
       timeout: 30s
       retries: 3
@@ -383,5 +353,11 @@ volumes:
     driver: local
   wazuh-data:
     driver: local
-  model-cache:
-    driver: local
+
+# NOTE: Qwen Model runs on HOST via Docker Desktop Model Runner
+# Access via: http://host.docker.internal:11434
+# Setup instructions:
+# 1. Install Docker Desktop with Model Runner enabled
+# 2. Run: docker model run qwen2.5:7b-instruct
+# 3. The model will be available at localhost:11434 from host
+# 4. Containers access it via host.docker.internal:11434
