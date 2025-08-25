@@ -1,0 +1,387 @@
+version: '3.8'
+
+# Moby SwagStore - Secure MCP-Enabled E-commerce Platform
+# Based on pen-shop-demo architecture with enhanced security
+
+x-common-variables: &common-variables
+  POSTGRES_DB: swagstore
+  POSTGRES_USER: swagstore_user
+  REDIS_URL: redis://redis:6379
+  MCP_GATEWAY_URL: http://mcp-gateway:8080
+  QWEN_MODEL_URL: http://qwen-model:8000
+  WAZUH_MANAGER: wazuh-manager:1514
+
+x-security-labels: &security-labels
+  - "security.hardened=true"
+  - "security.rootless=true"
+  - "security.network.isolated=true"
+
+networks:
+  frontend:
+    driver: bridge
+    internal: false
+    labels:
+      - "network.zone=dmz"
+  backend:
+    driver: bridge
+    internal: true
+    labels:
+      - "network.zone=secure"
+  monitoring:
+    driver: bridge
+    internal: false
+    labels:
+      - "network.zone=monitoring"
+
+secrets:
+  postgres_password:
+    file: ./security/secrets/postgres_password.txt
+  jwt_secret:
+    file: ./security/secrets/jwt_secret.txt
+  mcp_api_key:
+    file: ./security/secrets/mcp_api_key.txt
+  wazuh_api_key:
+    file: ./security/secrets/wazuh_api_key.txt
+
+services:
+  # Frontend - Hardened Nginx with React App
+  frontend:
+    image: registry.hub.docker.com/dockerhub/hardened-nginx:1.25-alpine
+    container_name: swagstore-frontend
+    user: "1000:1000"  # rootless
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    volumes:
+      - ./src/frontend/dist:/usr/share/nginx/html:ro
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./security/certificates:/etc/nginx/ssl:ro
+    networks:
+      - frontend
+      - monitoring
+    labels: *security-labels
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Backend API - Hardened Node.js
+  backend:
+    image: registry.hub.docker.com/dockerhub/hardened-node:18-alpine
+    container_name: swagstore-backend
+    user: "1000:1000"  # rootless
+    restart: unless-stopped
+    working_dir: /app
+    environment:
+      <<: *common-variables
+      NODE_ENV: production
+      PORT: 8080
+    volumes:
+      - ./src/backend:/app:ro
+      - ./security/policies:/app/security:ro
+    networks:
+      - backend
+      - monitoring
+    labels: *security-labels
+    secrets:
+      - postgres_password
+      - jwt_secret
+      - mcp_api_key
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - postgres
+      - redis
+      - mcp-gateway
+
+  # MCP Gateway - Containerized Security Layer
+  mcp-gateway:
+    image: registry.hub.docker.com/ajeetraina/mcp-gateway-hardened:latest
+    container_name: swagstore-mcp-gateway
+    user: "1000:1000"  # rootless
+    restart: unless-stopped
+    environment:
+      MCP_DEFENDER_ENABLED: "true"
+      INPUT_SANITIZATION: "strict"
+      OUTPUT_FILTERING: "enabled"
+      RATE_LIMITING: "true"
+      AUDIT_LOGGING: "verbose"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config/mcp-gateway:/etc/mcp-gateway:ro
+      - ./security/policies:/etc/security:ro
+      - ./data/logs:/var/log/mcp:rw
+    networks:
+      - backend
+      - monitoring
+    labels: *security-labels
+    secrets:
+      - mcp_api_key
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Qwen Model Server - Hardened AI Model
+  qwen-model:
+    image: registry.hub.docker.com/ajeetraina/qwen-hardened:latest
+    container_name: swagstore-qwen
+    user: "1000:1000"  # rootless
+    restart: unless-stopped
+    environment:
+      MODEL_NAME: "Qwen2.5-7B-Instruct"
+      MAX_TOKENS: 4096
+      TEMPERATURE: 0.7
+      SECURITY_MODE: "strict"
+    volumes:
+      - ./data/models:/models:ro
+      - ./security/policies/ai-safety.json:/etc/ai-safety.json:ro
+    networks:
+      - backend
+    labels: *security-labels
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+
+  # Database - Hardened PostgreSQL
+  postgres:
+    image: registry.hub.docker.com/dockerhub/hardened-postgres:15-alpine
+    container_name: swagstore-db
+    user: "999:999"  # postgres user
+    restart: unless-stopped
+    environment:
+      <<: *common-variables
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: "--auth-local=peer --auth-host=md5"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+      - ./security/certificates/ca.crt:/var/lib/postgresql/ca.crt:ro
+    networks:
+      - backend
+      - monitoring
+    labels: *security-labels
+    secrets:
+      - postgres_password
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U swagstore_user -d swagstore"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis Cache - Hardened
+  redis:
+    image: registry.hub.docker.com/dockerhub/hardened-redis:7-alpine
+    container_name: swagstore-redis
+    user: "999:999"  # redis user
+    restart: unless-stopped
+    command: ["redis-server", "/etc/redis/redis.conf"]
+    volumes:
+      - ./config/redis/redis.conf:/etc/redis/redis.conf:ro
+      - ./data/redis:/data
+    networks:
+      - backend
+      - monitoring
+    labels: *security-labels
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Wazuh Manager - Security Monitoring
+  wazuh-manager:
+    image: registry.hub.docker.com/ajeetraina/wazuh-manager-hardened:4.7.0
+    container_name: swagstore-wazuh-manager
+    user: "1000:1000"  # rootless
+    restart: unless-stopped
+    environment:
+      INDEXER_URL: "https://wazuh-indexer:9200"
+      INDEXER_USERNAME: "admin"
+      INDEXER_PASSWORD: "SecretPassword"
+      FILEBEAT_SSL_VERIFICATION_MODE: "certificate"
+    volumes:
+      - ./config/wazuh/wazuh.conf:/var/ossec/etc/ossec.conf:ro
+      - ./data/logs:/var/log/host-logs:ro
+      - ./security/certificates:/etc/ssl/certs:ro
+    ports:
+      - "1514:1514"  # Agent connection
+      - "1515:1515"  # Agent enrollment
+      - "55000:55000" # API
+    networks:
+      - monitoring
+    labels: *security-labels
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:55000"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+
+  # Wazuh Dashboard - Security Interface
+  wazuh-dashboard:
+    image: registry.hub.docker.com/ajeetraina/wazuh-dashboard-hardened:4.7.0
+    container_name: swagstore-wazuh-dashboard
+    user: "1000:1000"  # rootless
+    restart: unless-stopped
+    environment:
+      INDEXER_USERNAME: "admin"
+      INDEXER_PASSWORD: "SecretPassword"
+      WAZUH_API_URL: "https://wazuh-manager"
+      DASHBOARD_USERNAME: "admin"
+      DASHBOARD_PASSWORD: "SecretPassword"
+    ports:
+      - "443:5601"
+    volumes:
+      - ./config/wazuh/dashboard.yml:/usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml:ro
+    networks:
+      - monitoring
+    labels: *security-labels
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      - wazuh-manager
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5601/status"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+
+  # MCP Defender - Input Sanitization
+  mcp-defender:
+    image: registry.hub.docker.com/ajeetraina/mcp-defender-hardened:latest
+    container_name: swagstore-mcp-defender
+    user: "1000:1000"  # rootless
+    restart: unless-stopped
+    environment:
+      DEFENSE_LEVEL: "strict"
+      PROMPT_INJECTION_DETECTION: "enabled"
+      CONTENT_FILTERING: "aggressive"
+      RATE_LIMITING: "enabled"
+    volumes:
+      - ./config/mcp-defender:/etc/mcp-defender:ro
+      - ./security/policies:/etc/policies:ro
+    networks:
+      - backend
+    labels: *security-labels
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Security Scanner - Continuous Monitoring
+  security-scanner:
+    image: registry.hub.docker.com/ajeetraina/security-scanner-hardened:latest
+    container_name: swagstore-security-scanner
+    user: "1000:1000"  # rootless
+    restart: unless-stopped
+    environment:
+      SCAN_INTERVAL: "300"  # 5 minutes
+      VULNERABILITY_DB_UPDATE: "daily"
+      REPORT_WEBHOOK: "http://wazuh-manager:55000/security-events"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./security/policies:/etc/policies:ro
+      - ./data/logs:/var/log/security:rw
+    networks:
+      - monitoring
+    labels: *security-labels
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE  # To read docker socket
+    depends_on:
+      - wazuh-manager
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  wazuh-data:
+    driver: local
+  model-cache:
+    driver: local
