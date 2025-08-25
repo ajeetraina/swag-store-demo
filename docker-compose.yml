@@ -1,15 +1,14 @@
 version: '3.8'
 
 # Moby SwagStore - Secure MCP-Enabled E-commerce Platform
-# Based on pen-shop-demo architecture with proper MCP Gateway and host-based Qwen model
+# Following pen-shop-demo architecture with proper Model Runner integration
 
 x-common-variables: &common-variables
   POSTGRES_DB: swagstore
   POSTGRES_USER: swagstore_user
   REDIS_URL: redis://redis:6379
-  MCP_GATEWAY_URL: http://mcp-gateway:8081
-  QWEN_MODEL_URL: http://host.docker.internal:11434  # Qwen running on host via Model Runner
-  WAZUH_MANAGER: wazuh-manager:1514
+  MCP_GATEWAY_URL: http://mcp-gateway:8811
+  CATALOGUE_URL: http://pen-catalogue:8081
 
 x-security-labels: &security-labels
   - "security.hardened=true"
@@ -42,6 +41,8 @@ secrets:
     file: ./security/secrets/mcp_api_key.txt
   wazuh_api_key:
     file: ./security/secrets/wazuh_api_key.txt
+  openai_api_key:
+    file: ./security/secrets/openai_api_key.txt
 
 services:
   # Frontend - Hardened Nginx with React App
@@ -56,6 +57,11 @@ services:
       - ./src/frontend/dist:/usr/share/nginx/html:ro
       - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./security/certificates:/etc/nginx/ssl:ro
+    environment:
+      - CATALOGUE_SERVICE_HOST=pen-catalogue
+      - CATALOGUE_SERVICE_PORT=8081
+      - API_BASE_URL=http://pen-catalogue:8081
+      - REACT_APP_STORE_NAME=Moby SwagStore
     networks:
       - frontend
       - monitoring
@@ -78,18 +84,25 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    depends_on:
+      - pen-catalogue
 
-  # Backend API - Hardened Node.js
+  # Backend API with Model Runner Integration
   backend:
     image: registry.hub.docker.com/dockerhub/hardened-node:18-alpine
     container_name: swagstore-backend
     user: "1000:1000"  # rootless
     restart: unless-stopped
     working_dir: /app
+    ports:
+      - "8000:8000"
     environment:
       <<: *common-variables
       NODE_ENV: production
-      PORT: 8080
+      PORT: 8000
+      MCPGATEWAY_ENDPOINT: http://mcp-gateway:8811/sse
+      MONGODB_URI: mongodb://admin:password@mongodb:27017/swagstore
+      AI_DEFAULT_MODEL: ai/qwen3
     volumes:
       - ./src/backend:/app:ro
       - ./security/policies:/app/security:ro
@@ -101,6 +114,7 @@ services:
       - postgres_password
       - jwt_secret
       - mcp_api_key
+      - openai_api_key
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -110,58 +124,122 @@ services:
       - /tmp
       - /app/logs
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
     depends_on:
       - postgres
-      - redis
+      - mongodb
       - mcp-gateway
+    models:
+      qwen3:
+        endpoint_var: MODEL_RUNNER_URL
+        model_var: MODEL_RUNNER_MODEL
 
-  # MCP Gateway - Docker's Official MCP Gateway (Corrected Port)
-  mcp-gateway:
-    image: docker/mcp-gateway:latest
-    container_name: swagstore-mcp-gateway
+  # Product Catalogue Service (following pen-shop-demo pattern)
+  pen-catalogue:
+    image: registry.hub.docker.com/dockerhub/hardened-node:18-alpine
+    container_name: swagstore-catalogue
     user: "1000:1000"  # rootless
     restart: unless-stopped
-    environment:
-      MCP_DEFENDER_ENABLED: "true"
-      INPUT_SANITIZATION: "strict"
-      OUTPUT_FILTERING: "enabled"
-      RATE_LIMITING: "true"
-      AUDIT_LOGGING: "verbose"
-      TRANSPORT: "streaming"
     ports:
-      - "8081:8081"  # Corrected port as per pen-shop-demo
+      - "8081:8081"
+    environment:
+      - MYSQL_HOST=catalogue-db
+      - MYSQL_PORT=3306
+      - MYSQL_DATABASE=swagstore
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_ROOT_PASSWORD:-password}
     volumes:
-      - ./config/mcp-gateway:/etc/mcp-gateway:ro
-      - ./security/policies:/etc/security:ro
-      - ./data/logs:/var/log/mcp:rw
-      - /var/run/docker.sock:/var/run/docker.sock:ro  # For managing MCP servers
+      - ./src/catalogue:/app:ro
     networks:
       - backend
       - monitoring
     labels: *security-labels
-    secrets:
-      - mcp_api_key
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    cap_add:
-      - DAC_OVERRIDE  # To access docker socket
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/logs
+    depends_on:
+      - catalogue-db
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-    command: ["gateway", "run", "--port", "8081", "--transport", "streaming"]
 
-  # Database - Hardened PostgreSQL
+  # MCP Gateway (Correct Implementation)
+  mcp-gateway:
+    image: docker/mcp-gateway:latest
+    container_name: swagstore-mcp-gateway
+    ports:
+      - "8811:8811"
+    use_api_socket: true
+    command:
+      - --transport=sse
+      - --servers=fetch,brave,curl,mongodb,inventory,customer,payment
+      - --config=/mcp_config
+      - --verbose
+    configs:
+      - mcp_config
+    networks:
+      - backend
+      - monitoring
+    labels: *security-labels
+    depends_on:
+      - mongodb
+      - postgres
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8811/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # MySQL Database for Product Catalogue
+  catalogue-db:
+    image: registry.hub.docker.com/dockerhub/hardened-mysql:8.0
+    container_name: swagstore-catalogue-db
+    user: "999:999"  # mysql user
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-password}
+      - MYSQL_DATABASE=swagstore
+      - MYSQL_USER=swaguser
+      - MYSQL_PASSWORD=swagpass
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./database/mysql-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - backend
+      - monitoring
+    labels: *security-labels
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL Database for User Data
   postgres:
     image: registry.hub.docker.com/dockerhub/hardened-postgres:15-alpine
-    container_name: swagstore-db
+    container_name: swagstore-postgres
     user: "999:999"  # postgres user
     restart: unless-stopped
     environment:
@@ -169,8 +247,8 @@ services:
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       POSTGRES_INITDB_ARGS: "--auth-local=peer --auth-host=md5"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./database/init:/docker-entrypoint-initdb.d:ro
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/postgres-init:/docker-entrypoint-initdb.d:ro
       - ./security/certificates/ca.crt:/var/lib/postgresql/ca.crt:ro
     networks:
       - backend
@@ -194,7 +272,37 @@ services:
       timeout: 10s
       retries: 3
 
-  # Redis Cache - Hardened
+  # MongoDB for MCP Data and Agent State
+  mongodb:
+    image: registry.hub.docker.com/dockerhub/hardened-mongo:7.0
+    container_name: swagstore-mongodb
+    user: "999:999"  # mongodb user
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=password
+      - MONGO_INITDB_DATABASE=swagstore
+    volumes:
+      - mongodb_data:/data/db
+      - ./data/mongodb-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - backend
+      - monitoring
+    labels: *security-labels
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: [mongod, --quiet, --logpath, /var/log/mongodb/mongod.log, --logappend]
+    healthcheck:
+      test: [CMD, mongosh, --eval, "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
   redis:
     image: registry.hub.docker.com/dockerhub/hardened-redis:7-alpine
     container_name: swagstore-redis
@@ -202,7 +310,7 @@ services:
     restart: unless-stopped
     command: ["redis-server", "/etc/redis/redis.conf"]
     volumes:
-      - redis-data:/data
+      - redis_data:/data
       - ./config/redis/redis.conf:/etc/redis/redis.conf:ro
     networks:
       - backend
@@ -233,7 +341,7 @@ services:
       INDEXER_PASSWORD: "SecretPassword"
       FILEBEAT_SSL_VERIFICATION_MODE: "certificate"
     volumes:
-      - wazuh-data:/var/ossec/data
+      - wazuh_data:/var/ossec/data
       - ./config/wazuh/wazuh.conf:/var/ossec/etc/ossec.conf:ro
       - ./data/logs:/var/log/host-logs:ro
       - ./security/certificates:/etc/ssl/certs:ro
@@ -285,79 +393,36 @@ services:
       timeout: 30s
       retries: 3
 
-  # MCP Defender - Input Sanitization (Containerized MCP Server)
-  mcp-defender:
-    image: registry.hub.docker.com/ajeetraina/mcp-defender-hardened:latest
-    container_name: swagstore-mcp-defender
-    user: "1000:1000"  # rootless
-    restart: unless-stopped
-    environment:
-      DEFENSE_LEVEL: "strict"
-      PROMPT_INJECTION_DETECTION: "enabled"
-      CONTENT_FILTERING: "aggressive"
-      RATE_LIMITING: "enabled"
-    volumes:
-      - ./config/mcp-defender:/etc/mcp-defender:ro
-      - ./security/policies:/etc/policies:ro
-    networks:
-      - backend
-    labels: *security-labels
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    read_only: true
-    tmpfs:
-      - /tmp
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # Security Scanner - Continuous Monitoring
-  security-scanner:
-    image: registry.hub.docker.com/ajeetraina/security-scanner-hardened:latest
-    container_name: swagstore-security-scanner
-    user: "1000:1000"  # rootless
-    restart: unless-stopped
-    environment:
-      SCAN_INTERVAL: "300"  # 5 minutes
-      VULNERABILITY_DB_UPDATE: "daily"
-      REPORT_WEBHOOK: "http://wazuh-manager:55000/security-events"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./security/policies:/etc/policies:ro
-      - ./data/logs:/var/log/security:rw
-    networks:
-      - monitoring
-    labels: *security-labels
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - DAC_OVERRIDE  # To read docker socket
-    depends_on:
-      - wazuh-manager
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8083/health"]
-      interval: 60s
-      timeout: 30s
-      retries: 3
+# Model Runner Configuration (Docker Desktop integration)
+models:
+  qwen3:
+    model: ai/qwen3:14B-Q6_K
+    context_size: 32768
 
 volumes:
-  postgres-data:
+  postgres_data:
     driver: local
-  redis-data:
+  mysql_data:
     driver: local
-  wazuh-data:
+  mongodb_data:
+    driver: local
+  redis_data:
+    driver: local
+  wazuh_data:
     driver: local
 
-# NOTE: Qwen Model runs on HOST via Docker Desktop Model Runner
-# Access via: http://host.docker.internal:11434
-# Setup instructions:
-# 1. Install Docker Desktop with Model Runner enabled
-# 2. Run: docker model run qwen2.5:7b-instruct
-# 3. The model will be available at localhost:11434 from host
-# 4. Containers access it via host.docker.internal:11434
+configs:
+  mcp_config:
+    content: |
+      mongodb:
+        connection_string: mongodb://admin:password@mongodb:27017/swagstore
+      postgres:
+        connection_string: postgresql://swagstore_user:password@postgres:5432/swagstore
+      brave:
+        api_key: ${BRAVE_API_KEY:-demo_key}
+      inventory:
+        endpoint: http://backend:8000/mcp/inventory
+      customer:
+        endpoint: http://backend:8000/mcp/customer
+      payment:
+        endpoint: http://backend:8000/mcp/payment
